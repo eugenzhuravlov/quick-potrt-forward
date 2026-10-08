@@ -251,6 +251,29 @@ public static class ConsoleLogger
         }
     }
 
+    public static string BuildStatusReport(IReadOnlyList<ForwardRule> rules)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Итоговая статистика перед закрытием приложения:");
+        int totalActive = 0;
+        long totalForwarded = 0;
+        long totalBytesSent = 0;
+        long totalBytesRecv = 0;
+
+        foreach (var r in rules)
+        {
+            totalActive += r.ActiveConnections;
+            totalForwarded += r.TotalConnections;
+            totalBytesSent += r.TotalBytesSent;
+            totalBytesRecv += r.TotalBytesReceived;
+
+            sb.AppendLine($"  [{r.ListenPort} -> {r.TargetHost}:{r.TargetPort}] Активных: {r.ActiveConnections} | Всего проброшено: {r.TotalConnections} | Трафик: {FormatBytes(r.TotalBytesSent + r.TotalBytesReceived)} (↑ {FormatBytes(r.TotalBytesSent)}, ↓ {FormatBytes(r.TotalBytesReceived)})");
+        }
+
+        sb.AppendLine($"  ИТОГО: Активных: {totalActive} | Всего проброшено: {totalForwarded} | Общий трафик: {FormatBytes(totalBytesSent + totalBytesRecv)}");
+        return sb.ToString().TrimEnd();
+    }
+
     public static void PrintStatus(IReadOnlyList<ForwardRule> rules)
     {
         lock (ConsoleLock)
@@ -641,8 +664,34 @@ public static class Program
                         {
                             ConsoleLogger.PrintStatus(rules);
                         }
+                        else if (key.Key == ConsoleKey.Q || key.Key == ConsoleKey.X)
+                        {
+                            cts.Cancel();
+                            break;
+                        }
                     }
                     await Task.Delay(200, cts.Token);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Если ввод перенаправлен (pipe/background), читаем строки или завершаем при EOF
+                    try
+                    {
+                        string? line = await Console.In.ReadLineAsync(cts.Token);
+                        if (line == null || line.Trim().Equals("q", StringComparison.OrdinalIgnoreCase) || line.Trim().Equals("exit", StringComparison.OrdinalIgnoreCase))
+                        {
+                            cts.Cancel();
+                            break;
+                        }
+                        else if (line.Trim().Equals("s", StringComparison.OrdinalIgnoreCase))
+                        {
+                            ConsoleLogger.PrintStatus(rules);
+                        }
+                    }
+                    catch
+                    {
+                        break;
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -670,6 +719,22 @@ public static class Program
             await monitorTask;
         }
         catch { }
+
+        int statsLogged = 0;
+        void LogFinalStats()
+        {
+            if (Interlocked.Exchange(ref statsLogged, 1) == 0)
+            {
+                string statusReport = ConsoleLogger.BuildStatusReport(rules);
+                ConsoleLogger.PrintStatus(rules);
+                EventViewerLogger.LogInformation(statusReport, 1005);
+            }
+        }
+
+        AppDomain.CurrentDomain.ProcessExit += (s, e) => LogFinalStats();
+
+        // Вывод итоговой статистики на экран и запись в EventViewer перед закрытием
+        LogFinalStats();
 
         foreach (var svc in services)
         {
