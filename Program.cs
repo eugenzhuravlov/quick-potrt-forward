@@ -9,6 +9,7 @@ namespace PortForwarder;
 
 public sealed class ForwardRule
 {
+    public string ListenHost { get; }
     public int ListenPort { get; }
     public string TargetHost { get; }
     public int TargetPort { get; }
@@ -23,11 +24,17 @@ public sealed class ForwardRule
     public long TotalBytesSent => Volatile.Read(ref _totalBytesSent);
     public long TotalBytesReceived => Volatile.Read(ref _totalBytesReceived);
 
-    public ForwardRule(int listenPort, string targetHost, int targetPort)
+    public ForwardRule(string listenHost, int listenPort, string targetHost, int targetPort)
     {
+        ListenHost = string.IsNullOrWhiteSpace(listenHost) ? "0.0.0.0" : listenHost;
         ListenPort = listenPort;
         TargetHost = targetHost;
         TargetPort = targetPort;
+    }
+
+    public ForwardRule(int listenPort, string targetHost, int targetPort)
+        : this("0.0.0.0", listenPort, targetHost, targetPort)
+    {
     }
 
     public void IncrementConnections()
@@ -47,7 +54,21 @@ public sealed class ForwardRule
         Interlocked.Add(ref _totalBytesReceived, received);
     }
 
-    public override string ToString() => $"{ListenPort} -> {TargetHost}:{TargetPort}";
+    public bool ConflictsWith(ForwardRule other)
+    {
+        if (ListenPort != other.ListenPort)
+            return false;
+
+        bool thisIsAll = ListenHost == "0.0.0.0" || ListenHost == "*" || ListenHost == "::";
+        bool otherIsAll = other.ListenHost == "0.0.0.0" || other.ListenHost == "*" || other.ListenHost == "::";
+
+        if (thisIsAll || otherIsAll)
+            return true;
+
+        return string.Equals(ListenHost, other.ListenHost, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public override string ToString() => $"{ListenHost}:{ListenPort} -> {TargetHost}:{TargetPort}";
 
     public static bool TryParse(string input, out ForwardRule? rule, out string errorMessage)
     {
@@ -61,18 +82,47 @@ public sealed class ForwardRule
         }
 
         var trimmed = input.Trim().Trim('"', '\'');
-        int firstColon = trimmed.IndexOf(':');
-        int lastColon = trimmed.LastIndexOf(':');
+        var tokens = SplitIgnoringBrackets(trimmed, ':');
 
-        if (firstColon <= 0 || lastColon <= firstColon)
+        string listenHost = "0.0.0.0";
+        string listenPortStr;
+        string targetHost;
+        string targetPortStr;
+
+        if (tokens.Count == 3)
         {
-            errorMessage = $"Неверный формат '{input}'. Ожидается: <listen_port>:<target_host>:<target_port> (например: 2022:192.168.1.150:22)";
+            // Формат по умолчанию: listen_port:target_ip:target_port (интерфейс 0.0.0.0)
+            listenPortStr = tokens[0];
+            targetHost = tokens[1];
+            targetPortStr = tokens[2];
+        }
+        else if (tokens.Count == 4)
+        {
+            // Расширенный формат: listen_ip:listen_port:target_ip:target_port
+            listenHost = tokens[0];
+            listenPortStr = tokens[1];
+            targetHost = tokens[2];
+            targetPortStr = tokens[3];
+        }
+        else
+        {
+            errorMessage = $"Неверный формат '{input}'. Ожидается: [listen_ip:]<listen_port>:<target_ip>:<target_port> (например: 2022:192.168.1.150:22 или 0.0.0.0:2022:192.168.1.150:22)";
             return false;
         }
 
-        string listenPortStr = trimmed[..firstColon];
-        string targetHostStr = trimmed.Substring(firstColon + 1, lastColon - firstColon - 1);
-        string targetPortStr = trimmed[(lastColon + 1)..];
+        if (listenHost.StartsWith('[') && listenHost.EndsWith(']'))
+            listenHost = listenHost[1..^1];
+        if (string.IsNullOrWhiteSpace(listenHost))
+            listenHost = "0.0.0.0";
+
+        if (targetHost.StartsWith('[') && targetHost.EndsWith(']'))
+            targetHost = targetHost[1..^1];
+
+        if (!IsValidListenHost(listenHost))
+        {
+            errorMessage = $"Некорректный интерфейс/IP для прослушивания '{listenHost}'. Допустимы: 0.0.0.0, 127.0.0.1, ::, localhost или конкретный IP-адрес интерфейса.";
+            return false;
+        }
 
         if (!int.TryParse(listenPortStr, out int listenPort) || listenPort < 1 || listenPort > 65535)
         {
@@ -80,15 +130,10 @@ public sealed class ForwardRule
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(targetHostStr))
+        if (string.IsNullOrWhiteSpace(targetHost))
         {
             errorMessage = "Целевой хост или IP-адрес не может быть пустым.";
             return false;
-        }
-
-        if (targetHostStr.StartsWith('[') && targetHostStr.EndsWith(']'))
-        {
-            targetHostStr = targetHostStr[1..^1];
         }
 
         if (!int.TryParse(targetPortStr, out int targetPort) || targetPort < 1 || targetPort > 65535)
@@ -97,15 +142,72 @@ public sealed class ForwardRule
             return false;
         }
 
-        // Проверка на петлю проброса (Self-Loop) на этапе парсинга
-        if (listenPort == targetPort && IsLocalHostOrIp(targetHostStr))
+        if (IsSelfLoop(listenHost, listenPort, targetHost, targetPort))
         {
-            errorMessage = $"Обнаружена петля проброса (Self-Loop)! Порт {listenPort} пробрасывается на {targetHostStr}:{targetPort} (этот же компьютер). Это вызовет бесконечный цикл подключений на самого себя.";
+            errorMessage = $"Обнаружена петля проброса (Self-Loop)! Порт {listenHost}:{listenPort} пробрасывается на {targetHost}:{targetPort} (этот же компьютер и порт). Это вызовет бесконечный цикл подключений на самого себя.";
             return false;
         }
 
-        rule = new ForwardRule(listenPort, targetHostStr, targetPort);
+        rule = new ForwardRule(listenHost, listenPort, targetHost, targetPort);
         return true;
+    }
+
+    private static List<string> SplitIgnoringBrackets(string input, char sep)
+    {
+        var list = new List<string>();
+        int bracketDepth = 0;
+        int start = 0;
+        for (int i = 0; i < input.Length; i++)
+        {
+            if (input[i] == '[') bracketDepth++;
+            else if (input[i] == ']') bracketDepth = Math.Max(0, bracketDepth - 1);
+            else if (input[i] == sep && bracketDepth == 0)
+            {
+                list.Add(input.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        list.Add(input.Substring(start));
+        return list;
+    }
+
+    private static bool IsValidListenHost(string host)
+    {
+        if (host == "0.0.0.0" || host == "*" || host == "::" || string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (IPAddress.TryParse(host, out _))
+            return true;
+
+        try
+        {
+            var addrs = Dns.GetHostAddresses(host);
+            return addrs.Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsSelfLoop(string listenHost, int listenPort, string targetHost, int targetPort)
+    {
+        if (listenPort != targetPort)
+            return false;
+
+        bool listenIsAll = listenHost == "0.0.0.0" || listenHost == "*" || listenHost == "::";
+        bool targetIsLocal = IsLocalHostOrIp(targetHost);
+
+        if (listenIsAll && targetIsLocal)
+            return true;
+
+        if (string.Equals(listenHost, targetHost, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (IPAddress.TryParse(listenHost, out var lIp) && IPAddress.TryParse(targetHost, out var tIp) && lIp.Equals(tIp))
+            return true;
+
+        return false;
     }
 
     public static bool IsLocalHostOrIp(string host)
@@ -123,7 +225,6 @@ public sealed class ForwardRule
                 if (IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any))
                     return true;
 
-                // Проверяем локальные IP-адреса сетевых интерфейсов машины
                 foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
                 {
                     var props = iface.GetIPProperties();
@@ -232,20 +333,20 @@ public static class ConsoleLogger
             Console.WriteLine("                     TCP PORT FORWARDER (ПРОБРОС ПОРТОВ)                       ");
             Console.WriteLine("================================================================================");
             Console.ResetColor();
-            Console.WriteLine("Режим прослушивания : Все сетевые интерфейсы (0.0.0.0 / Dual-Stack IPv4+IPv6)");
             Console.WriteLine($"Keep-Alive защита  : TCP Probes (15с/5с), Idle-Timeout: {(idleTimeoutSeconds > 0 ? $"{idleTimeoutSeconds}с" : "выключен")}");
-            Console.WriteLine("Защита от петель    : Включена (блокировка Self-Loop и повторных перенаправлений)");
-            Console.WriteLine("Логирование         : Консоль + Windows EventViewer -> Application");
+            Console.WriteLine("Защита от петель    : Включена (блокировка Self-Loop и конфликтующих правил)");
+            Console.WriteLine("Логирование         : Консоль + Windows EventViewer -> Application (ID: 1001-1005)");
             Console.WriteLine("--------------------------------------------------------------------------------");
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine("Активные правила проброса:");
             foreach (var rule in rules)
             {
-                Console.WriteLine($"  * Порт {rule.ListenPort}  ==>  {rule.TargetHost}:{rule.TargetPort}");
+                string ifaceDesc = (rule.ListenHost == "0.0.0.0" || rule.ListenHost == "*") ? "все интерфейсы (0.0.0.0)" : rule.ListenHost;
+                Console.WriteLine($"  * [{ifaceDesc}]:{rule.ListenPort}  ==>  {rule.TargetHost}:{rule.TargetPort}");
             }
             Console.ResetColor();
             Console.WriteLine("--------------------------------------------------------------------------------");
-            Console.WriteLine("Нажмите Ctrl+C для остановки. Нажмите 'S' для вывода текущей статистики.");
+            Console.WriteLine("Управление: Ctrl+C или Q - выход с записью статистики | S - статус");
             Console.WriteLine("================================================================================");
             Console.WriteLine();
         }
@@ -267,7 +368,7 @@ public static class ConsoleLogger
             totalBytesSent += r.TotalBytesSent;
             totalBytesRecv += r.TotalBytesReceived;
 
-            sb.AppendLine($"  [{r.ListenPort} -> {r.TargetHost}:{r.TargetPort}] Активных: {r.ActiveConnections} | Всего проброшено: {r.TotalConnections} | Трафик: {FormatBytes(r.TotalBytesSent + r.TotalBytesReceived)} (↑ {FormatBytes(r.TotalBytesSent)}, ↓ {FormatBytes(r.TotalBytesReceived)})");
+            sb.AppendLine($"  [{r.ListenHost}:{r.ListenPort} -> {r.TargetHost}:{r.TargetPort}] Активных: {r.ActiveConnections} | Всего проброшено: {r.TotalConnections} | Трафик: {FormatBytes(r.TotalBytesSent + r.TotalBytesReceived)} (↑ {FormatBytes(r.TotalBytesSent)}, ↓ {FormatBytes(r.TotalBytesReceived)})");
         }
 
         sb.AppendLine($"  ИТОГО: Активных: {totalActive} | Всего проброшено: {totalForwarded} | Общий трафик: {FormatBytes(totalBytesSent + totalBytesRecv)}");
@@ -287,7 +388,7 @@ public static class ConsoleLogger
             {
                 totalActive += r.ActiveConnections;
                 totalForwarded += r.TotalConnections;
-                Console.WriteLine($"  [{r.ListenPort} -> {r.TargetHost}:{r.TargetPort}]");
+                Console.WriteLine($"  [{r.ListenHost}:{r.ListenPort} -> {r.TargetHost}:{r.TargetPort}]");
                 Console.WriteLine($"    Активных подключений: {r.ActiveConnections,4} | Всего проброшено: {r.TotalConnections,6} | Трафик: {FormatBytes(r.TotalBytesSent + r.TotalBytesReceived)}");
             }
             Console.WriteLine($"  ИТОГО: Активных: {totalActive} | Всего проброшено: {totalForwarded}");
@@ -330,19 +431,49 @@ public sealed class ForwardingService : IAsyncDisposable
 
     public void Start()
     {
-        try
+        string host = _rule.ListenHost;
+        string startMsg;
+
+        if (host == "0.0.0.0" || host == "*" || string.IsNullOrWhiteSpace(host))
+        {
+            try
+            {
+                _listener = new TcpListener(IPAddress.IPv6Any, _rule.ListenPort);
+                _listener.Server.DualMode = true;
+                _listener.Start();
+            }
+            catch
+            {
+                _listener = new TcpListener(IPAddress.Any, _rule.ListenPort);
+                _listener.Start();
+            }
+            startMsg = $"Служба запущена: порт {_rule.ListenPort} на всех интерфейсах (0.0.0.0) -> {_rule.TargetHost}:{_rule.TargetPort}";
+        }
+        else if (host == "::" || host == "[::]")
         {
             _listener = new TcpListener(IPAddress.IPv6Any, _rule.ListenPort);
-            _listener.Server.DualMode = true;
             _listener.Start();
+            startMsg = $"Служба запущена: порт {_rule.ListenPort} на интерфейсе [::] -> {_rule.TargetHost}:{_rule.TargetPort}";
         }
-        catch
+        else
         {
-            _listener = new TcpListener(IPAddress.Any, _rule.ListenPort);
+            IPAddress bindIp;
+            if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+            {
+                bindIp = IPAddress.Loopback;
+            }
+            else if (!IPAddress.TryParse(host, out bindIp!))
+            {
+                var addrs = Dns.GetHostAddresses(host);
+                if (addrs.Length == 0) throw new InvalidOperationException($"Не удалось определить IP-адрес для интерфейса '{host}'.");
+                bindIp = addrs[0];
+            }
+
+            _listener = new TcpListener(bindIp, _rule.ListenPort);
             _listener.Start();
+            startMsg = $"Служба запущена: {bindIp}:{_rule.ListenPort} -> {_rule.TargetHost}:{_rule.TargetPort}";
         }
 
-        string startMsg = $"Служба запущена: порт {_rule.ListenPort} на всех интерфейсах -> {_rule.TargetHost}:{_rule.TargetPort}";
         ConsoleLogger.Log(ConsoleColor.Green, "LISTENER", startMsg);
         EventViewerLogger.LogInformation(startMsg, 1001);
 
@@ -369,7 +500,7 @@ public sealed class ForwardingService : IAsyncDisposable
             {
                 if (!_cts.IsCancellationRequested)
                 {
-                    string err = $"Ошибка приема подключения на порту {_rule.ListenPort}: {ex.Message}";
+                    string err = $"Ошибка приема подключения на порту {_rule.ListenHost}:{_rule.ListenPort}: {ex.Message}";
                     ConsoleLogger.Log(ConsoleColor.Red, "ERROR", err);
                     EventViewerLogger.LogError(err, 2001);
                 }
@@ -381,15 +512,11 @@ public sealed class ForwardingService : IAsyncDisposable
     {
         try
         {
-            socket.NoDelay = true; // Отключаем алгоритм Nagle для отзывчивости
-
-            // Включаем TCP Keep-Alive зонды
+            socket.NoDelay = true;
             socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-
-            // Настройка таймингов Keep-Alive в Windows (.NET 9)
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 15);      // Первый зонд через 15 секунд простоя
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);  // Повторные зонды каждые 5 секунд
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // 3 попытки, затем разрыв мертвого сокета
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 15);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
         }
         catch { }
     }
@@ -400,7 +527,7 @@ public sealed class ForwardingService : IAsyncDisposable
         var sw = Stopwatch.StartNew();
         string clientEp = client.Client.RemoteEndPoint?.ToString() ?? "Unknown";
 
-        string connectMsg = $"[#{connId}] Подключен клиент: {clientEp} -> {_rule.TargetHost}:{_rule.TargetPort} (Слушаем :{_rule.ListenPort}) | Активных: {_rule.ActiveConnections} | Всего: {_rule.TotalConnections}";
+        string connectMsg = $"[#{connId}] Подключен клиент: {clientEp} -> {_rule.TargetHost}:{_rule.TargetPort} (Слушаем {_rule.ListenHost}:{_rule.ListenPort}) | Активных: {_rule.ActiveConnections} | Всего: {_rule.TotalConnections}";
         ConsoleLogger.Log(ConsoleColor.Green, "CONNECT", connectMsg);
         EventViewerLogger.LogInformation(connectMsg, 1002);
 
@@ -412,19 +539,17 @@ public sealed class ForwardingService : IAsyncDisposable
 
             try
             {
-                // Подключение к целевому серверу с таймаутом
                 using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(sessionCts.Token);
                 connectCts.CancelAfter(TimeSpan.FromSeconds(10));
 
                 await targetClient.ConnectAsync(_rule.TargetHost, _rule.TargetPort, connectCts.Token);
                 ConfigureSocketOptions(targetClient.Client);
 
-                // Защита во время выполнения: если целевой клиент подключился обратно к нашему же листенеpy
                 if (targetClient.Client.RemoteEndPoint is IPEndPoint targetRemoteEp &&
                     targetRemoteEp.Port == _rule.ListenPort &&
                     ForwardRule.IsLocalHostOrIp(targetRemoteEp.Address.ToString()))
                 {
-                    throw new InvalidOperationException("Обнаружена петля соединения (Self-loop connection loop)! Разрыв соединения.");
+                    throw new InvalidOperationException("Обнаружена динамическая петля соединения (Self-loop connection)! Разрыв соединения.");
                 }
 
                 using var clientStream = client.GetStream();
@@ -433,7 +558,6 @@ public sealed class ForwardingService : IAsyncDisposable
                 long lastActivityTicks = DateTime.UtcNow.Ticks;
                 void UpdateActivity() => Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
 
-                // Фоновый сторож неактивности (Idle Timeout Watchdog)
                 Task? idleWatchdogTask = null;
                 if (_idleTimeoutSeconds > 0)
                 {
@@ -446,7 +570,6 @@ public sealed class ForwardingService : IAsyncDisposable
                             long idleTicks = DateTime.UtcNow.Ticks - Interlocked.Read(ref lastActivityTicks);
                             if (idleTicks > timeoutTicks)
                             {
-                                // Закрываем зависшее keep-alive соединение по таймауту неактивности
                                 sessionCts.Cancel();
                                 break;
                             }
@@ -457,12 +580,8 @@ public sealed class ForwardingService : IAsyncDisposable
                 var clientToTarget = RelayTrafficAsync(clientStream, targetStream, sessionCts.Token, UpdateActivity);
                 var targetToClient = RelayTrafficAsync(targetStream, clientStream, sessionCts.Token, UpdateActivity);
 
-                // Ждем завершения передачи в любую из сторон
                 var completedTask = await Task.WhenAny(clientToTarget, targetToClient);
 
-                // КРИТИЧЕСКИЙ FIX ДЛЯ KEEP-ALIVE:
-                // Как только одна сторона завершила передачу (или разорвала связь), немедленно отменяем токен сессии
-                // и принудительно гасим сокеты, чтобы вторая сторона не висела вечно!
                 sessionCts.Cancel();
 
                 try { client.Client.Shutdown(SocketShutdown.Both); } catch { }
@@ -482,7 +601,7 @@ public sealed class ForwardingService : IAsyncDisposable
                 sw.Stop();
                 _rule.DecrementConnections();
 
-                string disconnectMsg = $"[#{connId}] Отключен клиент: {clientEp} (Правило :{_rule.ListenPort} -> {_rule.TargetHost}:{_rule.TargetPort}) | Длительность: {sw.Elapsed.TotalSeconds:F1}с | Трафик: ↑ {ConsoleLogger.FormatBytes(sent)}, ↓ {ConsoleLogger.FormatBytes(received)} | Активных: {_rule.ActiveConnections}";
+                string disconnectMsg = $"[#{connId}] Отключен клиент: {clientEp} (Правило {_rule.ListenHost}:{_rule.ListenPort} -> {_rule.TargetHost}:{_rule.TargetPort}) | Длительность: {sw.Elapsed.TotalSeconds:F1}с | Трафик: ↑ {ConsoleLogger.FormatBytes(sent)}, ↓ {ConsoleLogger.FormatBytes(received)} | Активных: {_rule.ActiveConnections}";
                 ConsoleLogger.Log(ConsoleColor.Yellow, "DISCONNECT", disconnectMsg);
                 EventViewerLogger.LogInformation(disconnectMsg, 1003);
             }
@@ -500,14 +619,14 @@ public sealed class ForwardingService : IAsyncDisposable
 
     private static async Task<long> RelayTrafficAsync(NetworkStream source, NetworkStream destination, CancellationToken ct, Action onActivity)
     {
-        byte[] buffer = new byte[65536]; // 64 KB буфер
+        byte[] buffer = new byte[65536];
         long totalBytes = 0;
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 int bytesRead = await source.ReadAsync(buffer, ct);
-                if (bytesRead == 0) break; // Нормальный EOF / закрытие половины сокета
+                if (bytesRead == 0) break;
 
                 onActivity();
                 await destination.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
@@ -540,7 +659,7 @@ public sealed class ForwardingService : IAsyncDisposable
             catch { }
         }
 
-        string stopMsg = $"Служба на порту {_rule.ListenPort} остановлена. Всего обработано подключений: {_rule.TotalConnections}";
+        string stopMsg = $"Служба {_rule.ListenHost}:{_rule.ListenPort} остановлена. Всего обработано подключений: {_rule.TotalConnections}";
         ConsoleLogger.Log(ConsoleColor.DarkYellow, "STOP", stopMsg);
         EventViewerLogger.LogInformation(stopMsg, 1004);
 
@@ -555,7 +674,7 @@ public static class Program
         Console.OutputEncoding = System.Text.Encoding.UTF8;
 
         var rules = new List<ForwardRule>();
-        int idleTimeoutSeconds = 120; // 2 минуты таймаут простоя для Keep-Alive по умолчанию
+        int idleTimeoutSeconds = 120;
 
         var rawRules = new List<string>();
         for (int i = 0; i < args.Length; i++)
@@ -589,7 +708,7 @@ public static class Program
 
         if (rawRules.Count == 0)
         {
-            string defaultArg = "2022:192.168.1.150:22";
+            string defaultArg = "0.0.0.0:2022:192.168.1.150:22";
             if (ForwardRule.TryParse(defaultArg, out var defaultRule, out _))
             {
                 rules.Add(defaultRule!);
@@ -609,10 +728,10 @@ public static class Program
                     return 1;
                 }
 
-                if (rules.Any(r => r.ListenPort == rule!.ListenPort))
+                if (rules.Any(r => r.ConflictsWith(rule!)))
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"Ошибка: Порт прослушивания {rule!.ListenPort} указан несколько раз!");
+                    Console.WriteLine($"Ошибка: Конфликт правил прослушивания! Правило '{rule}' конфликтует с уже добавленным правилом.");
                     Console.ResetColor();
                     return 1;
                 }
@@ -674,7 +793,6 @@ public static class Program
                 }
                 catch (InvalidOperationException)
                 {
-                    // Если ввод перенаправлен (pipe/background), читаем строки или завершаем при EOF
                     try
                     {
                         string? line = await Console.In.ReadLineAsync(cts.Token);
@@ -733,7 +851,6 @@ public static class Program
 
         AppDomain.CurrentDomain.ProcessExit += (s, e) => LogFinalStats();
 
-        // Вывод итоговой статистики на экран и запись в EventViewer перед закрытием
         LogFinalStats();
 
         foreach (var svc in services)
@@ -750,16 +867,24 @@ public static class Program
         Console.WriteLine("TCP Port Forwarder - Проброс портов на внешние и внутренние адреса.");
         Console.WriteLine();
         Console.WriteLine("Использование:");
-        Console.WriteLine("  PortForwarder [опции] [listen_port:target_ip_or_host:target_port] ...");
+        Console.WriteLine("  PortForwarder [опции] [[listen_ip:]listen_port:target_ip:target_port] ...");
+        Console.WriteLine();
+        Console.WriteLine("Формат правил:");
+        Console.WriteLine("  *([listen_ip][:])!([listen_port][:])!([target_ip][:])!([target_port])");
+        Console.WriteLine("  где listen_ip опционален (по умолчанию 0.0.0.0 - все интерфейсы).");
         Console.WriteLine();
         Console.WriteLine("Опции:");
         Console.WriteLine("  --idle-timeout <сек>   Таймаут простоя неактивного соединения (по умолчанию 120с). 0 = выключить.");
         Console.WriteLine();
         Console.WriteLine("Примеры:");
         Console.WriteLine("  PortForwarder 2022:192.168.1.150:22");
-        Console.WriteLine("  PortForwarder 2022:192.168.1.150:22 8088:192.168.1.150:8080");
-        Console.WriteLine("  PortForwarder --idle-timeout 60 2022:192.168.1.150:22");
+        Console.WriteLine("  PortForwarder 0.0.0.0:2022:192.168.1.150:22");
+        Console.WriteLine("  PortForwarder 127.0.0.1:2022:192.168.1.150:22");
+        Console.WriteLine("  PortForwarder 192.168.1.24:8088:192.168.1.150:8080");
+        Console.WriteLine("  PortForwarder --idle-timeout 60 2022:192.168.1.150:22 8088:192.168.1.150:8080");
         Console.WriteLine();
-        Console.WriteLine("Внимание: Запрещен Self-Loop (например: 8080:127.0.0.1:8080) во избежание бесконечной петли!");
+        Console.WriteLine("Управление:");
+        Console.WriteLine("  Ctrl+C или Q   - Корректная остановка служб и запись финальной статистики в EventViewer");
+        Console.WriteLine("  S              - Вывод текущей статистики всех соединений на экран");
     }
 }
