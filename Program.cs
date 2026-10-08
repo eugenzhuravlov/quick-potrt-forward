@@ -2,8 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
-using System.Text.RegularExpressions;
 
 namespace PortForwarder;
 
@@ -60,12 +60,7 @@ public sealed class ForwardRule
             return false;
         }
 
-        // Поддержка форматов:
-        // "2022:192.168.1.150:22"
-        // "2022:[::1]:22" (IPv6)
-        // "2022:hostname:22"
         var trimmed = input.Trim().Trim('"', '\'');
-        
         int firstColon = trimmed.IndexOf(':');
         int lastColon = trimmed.LastIndexOf(':');
 
@@ -91,7 +86,6 @@ public sealed class ForwardRule
             return false;
         }
 
-        // Очистить скобки IPv6 если есть: [::1] -> ::1
         if (targetHostStr.StartsWith('[') && targetHostStr.EndsWith(']'))
         {
             targetHostStr = targetHostStr[1..^1];
@@ -103,8 +97,47 @@ public sealed class ForwardRule
             return false;
         }
 
+        // Проверка на петлю проброса (Self-Loop) на этапе парсинга
+        if (listenPort == targetPort && IsLocalHostOrIp(targetHostStr))
+        {
+            errorMessage = $"Обнаружена петля проброса (Self-Loop)! Порт {listenPort} пробрасывается на {targetHostStr}:{targetPort} (этот же компьютер). Это вызовет бесконечный цикл подключений на самого себя.";
+            return false;
+        }
+
         rule = new ForwardRule(listenPort, targetHostStr, targetPort);
         return true;
+    }
+
+    public static bool IsLocalHostOrIp(string host)
+    {
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase) ||
+            host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" || host == "::")
+        {
+            return true;
+        }
+
+        try
+        {
+            if (IPAddress.TryParse(host, out var ip))
+            {
+                if (IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any))
+                    return true;
+
+                // Проверяем локальные IP-адреса сетевых интерфейсов машины
+                foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    var props = iface.GetIPProperties();
+                    foreach (var addr in props.UnicastAddresses)
+                    {
+                        if (addr.Address.Equals(ip))
+                            return true;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        return false;
     }
 }
 
@@ -121,7 +154,6 @@ public static class EventViewerLogger
         {
             if (OperatingSystem.IsWindows())
             {
-                // Проверяем наличие ключа источника в реестре без сканирования недоступного Security log
                 using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Services\EventLog\{LogName}\{EventSource}");
                 if (key != null)
                 {
@@ -129,7 +161,6 @@ public static class EventViewerLogger
                 }
                 else
                 {
-                    // Пробуем создать источник (требует прав администратора)
                     try
                     {
                         EventLog.CreateEventSource(new EventSourceCreationData(EventSource, LogName));
@@ -137,7 +168,6 @@ public static class EventViewerLogger
                     }
                     catch
                     {
-                        // При запуске без прав администратора используем стандартный источник "Application"
                         HasCustomSource = false;
                     }
                 }
@@ -149,25 +179,13 @@ public static class EventViewerLogger
         }
     }
 
-    public static void LogInformation(string message, int eventId = 1000)
-    {
-        WriteToEventLog(message, EventLogEntryType.Information, eventId);
-    }
-
-    public static void LogWarning(string message, int eventId = 2000)
-    {
-        WriteToEventLog(message, EventLogEntryType.Warning, eventId);
-    }
-
-    public static void LogError(string message, int eventId = 3000)
-    {
-        WriteToEventLog(message, EventLogEntryType.Error, eventId);
-    }
+    public static void LogInformation(string message, int eventId = 1000) => WriteToEventLog(message, EventLogEntryType.Information, eventId);
+    public static void LogWarning(string message, int eventId = 2000) => WriteToEventLog(message, EventLogEntryType.Warning, eventId);
+    public static void LogError(string message, int eventId = 3000) => WriteToEventLog(message, EventLogEntryType.Error, eventId);
 
     private static void WriteToEventLog(string message, EventLogEntryType entryType, int eventId)
     {
-        if (!OperatingSystem.IsWindows())
-            return;
+        if (!OperatingSystem.IsWindows()) return;
 
         lock (LogLock)
         {
@@ -205,7 +223,7 @@ public static class ConsoleLogger
 
     public static void LogConsole(ConsoleColor color, string tag, string message) => Log(color, tag, message);
 
-    public static void PrintHeader(IEnumerable<ForwardRule> rules)
+    public static void PrintHeader(IEnumerable<ForwardRule> rules, int idleTimeoutSeconds)
     {
         lock (ConsoleLock)
         {
@@ -214,8 +232,10 @@ public static class ConsoleLogger
             Console.WriteLine("                     TCP PORT FORWARDER (ПРОБРОС ПОРТОВ)                       ");
             Console.WriteLine("================================================================================");
             Console.ResetColor();
-            Console.WriteLine("Режим прослушивания: Все сетевые интерфейсы (0.0.0.0 / Dual-Stack IPv4+IPv6)");
-            Console.WriteLine("Логирование: Консоль + Windows EventViewer -> Application");
+            Console.WriteLine("Режим прослушивания : Все сетевые интерфейсы (0.0.0.0 / Dual-Stack IPv4+IPv6)");
+            Console.WriteLine($"Keep-Alive защита  : TCP Probes (15с/5с), Idle-Timeout: {(idleTimeoutSeconds > 0 ? $"{idleTimeoutSeconds}с" : "выключен")}");
+            Console.WriteLine("Защита от петель    : Включена (блокировка Self-Loop и повторных перенаправлений)");
+            Console.WriteLine("Логирование         : Консоль + Windows EventViewer -> Application");
             Console.WriteLine("--------------------------------------------------------------------------------");
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine("Активные правила проброса:");
@@ -271,6 +291,7 @@ public static class ConsoleLogger
 public sealed class ForwardingService : IAsyncDisposable
 {
     private readonly ForwardRule _rule;
+    private readonly int _idleTimeoutSeconds;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _listenerTask;
@@ -278,23 +299,22 @@ public sealed class ForwardingService : IAsyncDisposable
 
     public ForwardRule Rule => _rule;
 
-    public ForwardingService(ForwardRule rule)
+    public ForwardingService(ForwardRule rule, int idleTimeoutSeconds = 120)
     {
         _rule = rule;
+        _idleTimeoutSeconds = idleTimeoutSeconds;
     }
 
     public void Start()
     {
         try
         {
-            // Пытаемся слушать в DualMode (IPv6 + IPv4 на всех интерфейсах)
             _listener = new TcpListener(IPAddress.IPv6Any, _rule.ListenPort);
             _listener.Server.DualMode = true;
             _listener.Start();
         }
         catch
         {
-            // Fallback на IPv4 (0.0.0.0 на всех интерфейсах)
             _listener = new TcpListener(IPAddress.Any, _rule.ListenPort);
             _listener.Start();
         }
@@ -334,7 +354,24 @@ public sealed class ForwardingService : IAsyncDisposable
         }
     }
 
-    private async Task HandleClientAsync(TcpClient client, long connId, CancellationToken ct)
+    private void ConfigureSocketOptions(Socket socket)
+    {
+        try
+        {
+            socket.NoDelay = true; // Отключаем алгоритм Nagle для отзывчивости
+
+            // Включаем TCP Keep-Alive зонды
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+            // Настройка таймингов Keep-Alive в Windows (.NET 9)
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 15);      // Первый зонд через 15 секунд простоя
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);  // Повторные зонды каждые 5 секунд
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // 3 попытки, затем разрыв мертвого сокета
+        }
+        catch { }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, long connId, CancellationToken globalCt)
     {
         _rule.IncrementConnections();
         var sw = Stopwatch.StartNew();
@@ -346,31 +383,79 @@ public sealed class ForwardingService : IAsyncDisposable
 
         using (client)
         using (var targetClient = new TcpClient())
+        using (var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(globalCt))
         {
+            ConfigureSocketOptions(client.Client);
+
             try
             {
                 // Подключение к целевому серверу с таймаутом
-                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                connectCts.CancelAfter(TimeSpan.FromSeconds(15));
+                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(sessionCts.Token);
+                connectCts.CancelAfter(TimeSpan.FromSeconds(10));
 
                 await targetClient.ConnectAsync(_rule.TargetHost, _rule.TargetPort, connectCts.Token);
+                ConfigureSocketOptions(targetClient.Client);
 
-                // Отключаем Nagle алгоритм для быстродействия интерактивных сессий (SSH/RDP)
-                client.NoDelay = true;
-                targetClient.NoDelay = true;
+                // Защита во время выполнения: если целевой клиент подключился обратно к нашему же листенеpy
+                if (targetClient.Client.RemoteEndPoint is IPEndPoint targetRemoteEp &&
+                    targetRemoteEp.Port == _rule.ListenPort &&
+                    ForwardRule.IsLocalHostOrIp(targetRemoteEp.Address.ToString()))
+                {
+                    throw new InvalidOperationException("Обнаружена петля соединения (Self-loop connection loop)! Разрыв соединения.");
+                }
 
                 using var clientStream = client.GetStream();
                 using var targetStream = targetClient.GetStream();
 
-                var clientToTarget = RelayTrafficAsync(clientStream, targetStream, ct);
-                var targetToClient = RelayTrafficAsync(targetStream, clientStream, ct);
+                long lastActivityTicks = DateTime.UtcNow.Ticks;
+                void UpdateActivity() => Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
 
-                await Task.WhenAny(clientToTarget, targetToClient);
+                // Фоновый сторож неактивности (Idle Timeout Watchdog)
+                Task? idleWatchdogTask = null;
+                if (_idleTimeoutSeconds > 0)
+                {
+                    idleWatchdogTask = Task.Run(async () =>
+                    {
+                        var timeoutTicks = TimeSpan.FromSeconds(_idleTimeoutSeconds).Ticks;
+                        while (!sessionCts.Token.IsCancellationRequested)
+                        {
+                            await Task.Delay(1000, sessionCts.Token);
+                            long idleTicks = DateTime.UtcNow.Ticks - Interlocked.Read(ref lastActivityTicks);
+                            if (idleTicks > timeoutTicks)
+                            {
+                                // Закрываем зависшее keep-alive соединение по таймауту неактивности
+                                sessionCts.Cancel();
+                                break;
+                            }
+                        }
+                    }, sessionCts.Token);
+                }
 
-                long sent = await clientToTarget;
-                long received = await targetToClient;
+                var clientToTarget = RelayTrafficAsync(clientStream, targetStream, sessionCts.Token, UpdateActivity);
+                var targetToClient = RelayTrafficAsync(targetStream, clientStream, sessionCts.Token, UpdateActivity);
+
+                // Ждем завершения передачи в любую из сторон
+                var completedTask = await Task.WhenAny(clientToTarget, targetToClient);
+
+                // КРИТИЧЕСКИЙ FIX ДЛЯ KEEP-ALIVE:
+                // Как только одна сторона завершила передачу (или разорвала связь), немедленно отменяем токен сессии
+                // и принудительно гасим сокеты, чтобы вторая сторона не висела вечно!
+                sessionCts.Cancel();
+
+                try { client.Client.Shutdown(SocketShutdown.Both); } catch { }
+                try { targetClient.Client.Shutdown(SocketShutdown.Both); } catch { }
+
+                long sent = 0;
+                long received = 0;
+                try { sent = await clientToTarget; } catch { }
+                try { received = await targetToClient; } catch { }
+
+                if (idleWatchdogTask != null)
+                {
+                    try { await idleWatchdogTask; } catch { }
+                }
+
                 _rule.AddBytes(sent, received);
-
                 sw.Stop();
                 _rule.DecrementConnections();
 
@@ -383,25 +468,27 @@ public sealed class ForwardingService : IAsyncDisposable
                 sw.Stop();
                 _rule.DecrementConnections();
 
-                string errMsg = $"[#{connId}] Ошибка сессии {clientEp} -> {_rule.TargetHost}:{_rule.TargetPort}: {ex.Message} | Активных: {_rule.ActiveConnections}";
+                string errMsg = $"[#{connId}] Ошибка/таймаут сессии {clientEp} -> {_rule.TargetHost}:{_rule.TargetPort}: {ex.Message} | Активных: {_rule.ActiveConnections}";
                 ConsoleLogger.Log(ConsoleColor.Red, "ERROR", errMsg);
                 EventViewerLogger.LogError(errMsg, 2002);
             }
         }
     }
 
-    private static async Task<long> RelayTrafficAsync(NetworkStream source, NetworkStream destination, CancellationToken ct)
+    private static async Task<long> RelayTrafficAsync(NetworkStream source, NetworkStream destination, CancellationToken ct, Action onActivity)
     {
-        byte[] buffer = new byte[65536]; // 64 KB буфер для высокой пропускной способности
+        byte[] buffer = new byte[65536]; // 64 KB буфер
         long totalBytes = 0;
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 int bytesRead = await source.ReadAsync(buffer, ct);
-                if (bytesRead == 0) break; // Нормальное закрытие потока
+                if (bytesRead == 0) break; // Нормальный EOF / закрытие половины сокета
 
+                onActivity();
                 await destination.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
+                onActivity();
                 totalBytes += bytesRead;
             }
         }
@@ -445,10 +532,40 @@ public static class Program
         Console.OutputEncoding = System.Text.Encoding.UTF8;
 
         var rules = new List<ForwardRule>();
+        int idleTimeoutSeconds = 120; // 2 минуты таймаут простоя для Keep-Alive по умолчанию
 
-        if (args.Length == 0)
+        var rawRules = new List<string>();
+        for (int i = 0; i < args.Length; i++)
         {
-            // По умолчанию пробрасываем 2022:192.168.1.150:22 по требованию
+            var arg = args[i];
+
+            if (arg.Equals("--help", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("-h", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("/?", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintHelp();
+                return 0;
+            }
+
+            if (arg.StartsWith("--idle-timeout=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(arg["--idle-timeout=".Length..], out int t))
+                    idleTimeoutSeconds = t;
+                continue;
+            }
+
+            if (arg.Equals("--idle-timeout", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                if (int.TryParse(args[++i], out int t))
+                    idleTimeoutSeconds = t;
+                continue;
+            }
+
+            rawRules.Add(arg);
+        }
+
+        if (rawRules.Count == 0)
+        {
             string defaultArg = "2022:192.168.1.150:22";
             if (ForwardRule.TryParse(defaultArg, out var defaultRule, out _))
             {
@@ -457,28 +574,18 @@ public static class Program
         }
         else
         {
-            // Обработка параметров вида: 2022:192.168.1.150:22 в множественном числе
-            foreach (var arg in args)
+            foreach (var ruleStr in rawRules)
             {
-                if (arg.Equals("--help", StringComparison.OrdinalIgnoreCase) ||
-                    arg.Equals("-h", StringComparison.OrdinalIgnoreCase) ||
-                    arg.Equals("/?", StringComparison.OrdinalIgnoreCase))
-                {
-                    PrintHelp();
-                    return 0;
-                }
-
-                if (!ForwardRule.TryParse(arg, out var rule, out string error))
+                if (!ForwardRule.TryParse(ruleStr, out var rule, out string error))
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"Ошибка в параметре '{arg}': {error}");
+                    Console.WriteLine($"Ошибка в параметре '{ruleStr}': {error}");
                     Console.ResetColor();
                     Console.WriteLine();
                     PrintHelp();
                     return 1;
                 }
 
-                // Проверка на дублирование порта прослушивания
                 if (rules.Any(r => r.ListenPort == rule!.ListenPort))
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
@@ -491,14 +598,14 @@ public static class Program
             }
         }
 
-        ConsoleLogger.PrintHeader(rules);
+        ConsoleLogger.PrintHeader(rules, idleTimeoutSeconds);
 
         var services = new List<ForwardingService>();
         try
         {
             foreach (var rule in rules)
             {
-                var service = new ForwardingService(rule);
+                var service = new ForwardingService(rule, idleTimeoutSeconds);
                 service.Start();
                 services.Add(service);
             }
@@ -521,7 +628,6 @@ public static class Program
             cts.Cancel();
         };
 
-        // Фоновый поток для мониторинга нажатия клавиши 'S' (статус) и периодического вывода
         var monitorTask = Task.Run(async () =>
         {
             while (!cts.Token.IsCancellationRequested)
@@ -549,7 +655,6 @@ public static class Program
             }
         }, cts.Token);
 
-        // Ожидание сигнала завершения
         try
         {
             await Task.Delay(Timeout.Infinite, cts.Token);
@@ -580,17 +685,16 @@ public static class Program
         Console.WriteLine("TCP Port Forwarder - Проброс портов на внешние и внутренние адреса.");
         Console.WriteLine();
         Console.WriteLine("Использование:");
-        Console.WriteLine("  PortForwarder [listen_port:target_ip_or_host:target_port] ...");
+        Console.WriteLine("  PortForwarder [опции] [listen_port:target_ip_or_host:target_port] ...");
+        Console.WriteLine();
+        Console.WriteLine("Опции:");
+        Console.WriteLine("  --idle-timeout <сек>   Таймаут простоя неактивного соединения (по умолчанию 120с). 0 = выключить.");
         Console.WriteLine();
         Console.WriteLine("Примеры:");
         Console.WriteLine("  PortForwarder 2022:192.168.1.150:22");
-        Console.WriteLine("  PortForwarder 2022:192.168.1.150:22 8080:192.168.1.151:80 3389:192.168.1.100:3389");
+        Console.WriteLine("  PortForwarder 2022:192.168.1.150:22 8088:192.168.1.150:8080");
+        Console.WriteLine("  PortForwarder --idle-timeout 60 2022:192.168.1.150:22");
         Console.WriteLine();
-        Console.WriteLine("Поведение по умолчанию (без аргументов):");
-        Console.WriteLine("  Слушает на порту 2022 (все интерфейсы) и пробрасывает на 192.168.1.150:22");
-        Console.WriteLine();
-        Console.WriteLine("Логирование:");
-        Console.WriteLine("  Все события подключения, отключения и ошибок записываются в экранную консоль");
-        Console.WriteLine("  и в журнал Windows: EventViewer -> Application (Источник: PortForwarder или Application).");
+        Console.WriteLine("Внимание: Запрещен Self-Loop (например: 8080:127.0.0.1:8080) во избежание бесконечной петли!");
     }
 }
