@@ -355,7 +355,11 @@ public static class ConsoleLogger
     public static string BuildStatusReport(IReadOnlyList<ForwardRule> rules)
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine("Итоговая статистика перед закрытием приложения:");
+        sb.AppendLine("================================================================================");
+        sb.AppendLine("           ИТОГОВЫЙ ОТЧЁТ ПО ПРОБРОСАМ ПЕРЕД ЗАКРЫТИЕМ ПРИЛОЖЕНИЯ              ");
+        sb.AppendLine("================================================================================");
+        sb.AppendLine();
+        sb.AppendLine("1. ПРАВИЛА ПРОБРОСА:");
         int totalActive = 0;
         long totalForwarded = 0;
         long totalBytesSent = 0;
@@ -371,7 +375,39 @@ public static class ConsoleLogger
             sb.AppendLine($"  [{r.ListenHost}:{r.ListenPort} -> {r.TargetHost}:{r.TargetPort}] Активных: {r.ActiveConnections} | Всего проброшено: {r.TotalConnections} | Трафик: {FormatBytes(r.TotalBytesSent + r.TotalBytesReceived)} (↑ {FormatBytes(r.TotalBytesSent)}, ↓ {FormatBytes(r.TotalBytesReceived)})");
         }
 
-        sb.AppendLine($"  ИТОГО: Активных: {totalActive} | Всего проброшено: {totalForwarded} | Общий трафик: {FormatBytes(totalBytesSent + totalBytesRecv)}");
+        sb.AppendLine($"  ИТОГО ПО ПРАВИЛАМ: Активных: {totalActive} | Всего проброшено: {totalForwarded} | Общий трафик: {FormatBytes(totalBytesSent + totalBytesRecv)}");
+        sb.AppendLine();
+
+        sb.AppendLine("2. ДЕТАЛИЗАЦИЯ ПО IP-КЛИЕНТАМ И ПОРТАМ:");
+        var ipList = IpStatsTracker.GetAll(IpSortMode.Connections);
+        if (ipList.Count == 0)
+        {
+            sb.AppendLine("  Подключений клиентов не зафиксировано.");
+        }
+        else
+        {
+            foreach (var ipEntry in ipList)
+            {
+                sb.AppendLine("  ------------------------------------------------------------------------------");
+                sb.AppendLine($"  IP: {ipEntry.Ip} | Всего подключений: {ipEntry.TotalConnections} | Ошибок: {ipEntry.TotalErrors} | Трафик: {FormatBytes(ipEntry.TotalBytes)} (↑ {FormatBytes(ipEntry.TotalBytesSent)}, ↓ {FormatBytes(ipEntry.TotalBytesReceived)}) | Уникальных портов: {ipEntry.UniquePortsCount}");
+                sb.AppendLine($"  Сессия: c {ipEntry.FirstSeen:yyyy-MM-dd HH:mm:ss} по {ipEntry.LastSeen:yyyy-MM-dd HH:mm:ss}");
+
+                if (ipEntry.IsFullPortScan)
+                {
+                    sb.AppendLine("    * ВНИМАНИЕ: Обнаружен полный порт-скан (порты 1-65535).");
+                }
+                else
+                {
+                    var sortedPorts = ipEntry.Ports.Values.OrderBy(p => p.Port);
+                    foreach (var p in sortedPorts)
+                    {
+                        sb.AppendLine($"    * Порт {p.Port,5}: Подключений: {p.Connections,5} | Ошибок: {p.Errors,4} | Трафик: {FormatBytes(p.TotalBytes)} (↑ {FormatBytes(p.BytesSent)}, ↓ {FormatBytes(p.BytesReceived)})");
+                    }
+                }
+            }
+            sb.AppendLine("  ------------------------------------------------------------------------------");
+        }
+
         return sb.ToString().TrimEnd();
     }
 
@@ -400,31 +436,33 @@ public static class ConsoleLogger
 
     public static void ShowInteractiveIpStats(CancellationToken ct)
     {
-        var list = IpStatsTracker.GetAll();
-        if (list.Count == 0)
-        {
-            lock (ConsoleLock)
-            {
-                Console.WriteLine();
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("--------------------------------------------------------------------------------");
-                Console.WriteLine("                  СТАТИСТИКА ПОДКЛЮЧЕНИЙ ПО IP-АДРЕСАМ                         ");
-                Console.WriteLine("--------------------------------------------------------------------------------");
-                Console.WriteLine("  Подключений пока не зафиксировано.");
-                Console.WriteLine("--------------------------------------------------------------------------------");
-                Console.ResetColor();
-                Console.WriteLine();
-            }
-            return;
-        }
-
-        PrintIpStatsTable(list);
+        var sortMode = IpSortMode.Connections;
 
         while (!ct.IsCancellationRequested)
         {
+            var list = IpStatsTracker.GetAll(sortMode);
+            if (list.Count == 0)
+            {
+                lock (ConsoleLock)
+                {
+                    Console.WriteLine();
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("--------------------------------------------------------------------------------");
+                    Console.WriteLine("                  СТАТИСТИКА ПОДКЛЮЧЕНИЙ ПО IP-АДРЕСАМ                         ");
+                    Console.WriteLine("--------------------------------------------------------------------------------");
+                    Console.WriteLine("  Подключений пока не зафиксировано.");
+                    Console.WriteLine("--------------------------------------------------------------------------------");
+                    Console.ResetColor();
+                    Console.WriteLine();
+                }
+                return;
+            }
+
+            PrintIpStatsTable(list, sortMode);
+
             Console.WriteLine();
             Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.Write($"Введите номер строки [1-{list.Count}] для просмотра всех портов (или Enter/Esc для возврата): ");
+            Console.Write($"Введите номер строки [1-{list.Count}] | [T/Tab] - сменить сортировку ({IpStatsTracker.GetSortName(sortMode)}) | Enter/Esc - возврат: ");
             Console.ResetColor();
 
             string? line = ReadLineWithCancellation(ct);
@@ -440,20 +478,77 @@ public static class ConsoleLogger
                 break;
             }
 
+            if (line.Equals("t", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("s", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("sort", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("tab", StringComparison.OrdinalIgnoreCase))
+            {
+                sortMode = (IpSortMode)(((int)sortMode + 1) % 4);
+                continue;
+            }
+
             if (int.TryParse(line, out int index) && index >= 1 && index <= list.Count)
             {
-                PrintIpDetails(list[index - 1]);
+                ShowInteractiveIpDetails(list[index - 1], ct);
             }
             else
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Некорректный номер строки. Введите число от 1 до {list.Count} или Enter для возврата.");
+                Console.WriteLine($"Некорректная команда. Введите число от 1 до {list.Count}, 'T' для смены сортировки или Enter для возврата.");
                 Console.ResetColor();
             }
         }
     }
 
-    private static void PrintIpStatsTable(IReadOnlyList<IpStatsEntry> list)
+    public static void ShowInteractiveIpDetails(IpStatsEntry item, CancellationToken ct)
+    {
+        var portSortMode = PortSortMode.PortNumber;
+
+        while (!ct.IsCancellationRequested)
+        {
+            PrintIpDetails(item, portSortMode);
+
+            if (item.IsFullPortScan)
+            {
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write("Нажмите Enter или Esc для возврата к списку IP: ");
+                Console.ResetColor();
+                _ = ReadLineWithCancellation(ct);
+                break;
+            }
+
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.Write($"[T/Tab] - сменить сортировку портов ({IpStatsTracker.GetPortSortName(portSortMode)}) | Enter/Esc - назад: ");
+            Console.ResetColor();
+
+            string? line = ReadLineWithCancellation(ct);
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                break;
+            }
+
+            line = line.Trim();
+            if (line.Equals("q", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("exit", StringComparison.OrdinalIgnoreCase))
+            {
+                break;
+            }
+
+            if (line.Equals("t", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("s", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("sort", StringComparison.OrdinalIgnoreCase) ||
+                line.Equals("tab", StringComparison.OrdinalIgnoreCase))
+            {
+                portSortMode = (PortSortMode)(((int)portSortMode + 1) % 6);
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    private static void PrintIpStatsTable(IReadOnlyList<IpStatsEntry> list, IpSortMode sortMode)
     {
         lock (ConsoleLock)
         {
@@ -461,21 +556,22 @@ public static class ConsoleLogger
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==================================================================================================================================");
             Console.WriteLine("                                               СТАТИСТИКА ПОДКЛЮЧЕНИЙ ПО IP-АДРЕСАМ                                               ");
+            Console.WriteLine($" [Сортировка: {IpStatsTracker.GetSortName(sortMode)}]".PadRight(130));
             Console.WriteLine("==================================================================================================================================");
             Console.ResetColor();
 
             int ipColWidth = Math.Max(15, list.Max(x => x.Ip.Length));
 
             Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($" {"#",-4} {"IP адрес".PadRight(ipColWidth)}   {"Всего",-8}   {"Трафик",-12}   {"ТОП-5 портов (порт:кол-во)",-42}   {"Уникальных портов",-17}");
-            Console.WriteLine(new string('-', 4 + ipColWidth + 3 + 8 + 3 + 12 + 3 + 42 + 3 + 17 + 2));
+            Console.WriteLine($" {"#",-4} {"IP адрес".PadRight(ipColWidth)}   {"Всего",-8}   {"Ошибок",-7}   {"Трафик",-12}   {"ТОП-5 портов",-40}   {"Уникальных портов",-17}");
+            Console.WriteLine(new string('-', 4 + ipColWidth + 3 + 8 + 3 + 7 + 3 + 12 + 3 + 40 + 3 + 17 + 2));
             Console.ResetColor();
 
             for (int i = 0; i < list.Count; i++)
             {
                 var item = list[i];
                 string numStr = $"[{i + 1}]";
-                string topFormatted = item.GetTopPortsFormatted(5);
+                string topFormatted = item.GetTopPortsFormatted(sortMode, 5);
                 string trafficStr = FormatBytes(item.TotalBytes);
 
                 Console.ForegroundColor = ConsoleColor.Yellow;
@@ -484,36 +580,42 @@ public static class ConsoleLogger
                 Console.Write($"{item.Ip.PadRight(ipColWidth)}   ");
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.Write($"{item.TotalConnections,-8}   ");
+                Console.ForegroundColor = item.TotalErrors > 0 ? ConsoleColor.Red : ConsoleColor.DarkGray;
+                Console.Write($"{item.TotalErrors,-7}   ");
                 Console.ForegroundColor = ConsoleColor.DarkCyan;
                 Console.Write($"{trafficStr,-12}   ");
                 Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.Write($"{topFormatted,-42}   ");
+                Console.Write($"{topFormatted,-40}   ");
                 Console.ForegroundColor = ConsoleColor.Magenta;
                 Console.WriteLine($"{item.UniquePortsCount,-17}");
                 Console.ResetColor();
             }
 
             Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine(new string('-', 4 + ipColWidth + 3 + 8 + 3 + 12 + 3 + 42 + 3 + 17 + 2));
+            Console.WriteLine(new string('-', 4 + ipColWidth + 3 + 8 + 3 + 7 + 3 + 12 + 3 + 40 + 3 + 17 + 2));
             Console.ResetColor();
         }
     }
 
-    private static void PrintIpDetails(IpStatsEntry item)
+    private static void PrintIpDetails(IpStatsEntry item, PortSortMode sortMode)
     {
         lock (ConsoleLock)
         {
             Console.WriteLine();
             Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("--------------------------------------------------------------------------------------------------");
             Console.WriteLine($" ПОЛНЫЙ СПИСОК ПОРТОВ ДЛЯ IP: {item.Ip}");
-            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("--------------------------------------------------------------------------------------------------");
             Console.ResetColor();
             Console.WriteLine($" Всего подключений   : {item.TotalConnections}");
+            Console.WriteLine($" Всего ошибок        : {item.TotalErrors}");
             Console.WriteLine($" Общий трафик        : {FormatTraffic(item.TotalBytesSent, item.TotalBytesReceived)}");
             Console.WriteLine($" Уникальных портов   : {item.UniquePortsCount}");
             Console.WriteLine($" Первое подключение  : {item.FirstSeen:yyyy-MM-dd HH:mm:ss}");
             Console.WriteLine($" Крайнее подключение : {item.LastSeen:yyyy-MM-dd HH:mm:ss}");
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($" [Сортировка портов  : {IpStatsTracker.GetPortSortName(sortMode)}]");
+            Console.ResetColor();
             Console.WriteLine();
 
             if (item.IsFullPortScan)
@@ -525,22 +627,41 @@ public static class ConsoleLogger
             else
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine("  Порт       Подключений   Трафик");
-                Console.WriteLine("  -------------------------------------------------------------");
+                Console.WriteLine("  Порт       Подключений   Ошибок   Трафик");
+                Console.WriteLine("  ---------------------------------------------------------------------------------");
                 Console.ResetColor();
 
-                var sortedPorts = item.Ports.Values
-                    .OrderByDescending(p => p.Connections)
-                    .ThenBy(p => p.Port);
+                IEnumerable<IpPortStats> sortedPorts = sortMode switch
+                {
+                    PortSortMode.PortNumber => item.Ports.Values.OrderBy(p => p.Port),
+                    PortSortMode.Connections => item.Ports.Values.OrderByDescending(p => p.Connections).ThenBy(p => p.Port),
+                    PortSortMode.TotalTraffic => item.Ports.Values.OrderByDescending(p => p.TotalBytes).ThenBy(p => p.Port),
+                    PortSortMode.Incoming => item.Ports.Values.OrderByDescending(p => p.BytesReceived).ThenBy(p => p.Port),
+                    PortSortMode.Outgoing => item.Ports.Values.OrderByDescending(p => p.BytesSent).ThenBy(p => p.Port),
+                    PortSortMode.Errors => item.Ports.Values.OrderByDescending(p => p.Errors).ThenBy(p => p.Port),
+                    _ => item.Ports.Values.OrderBy(p => p.Port)
+                };
 
                 foreach (var p in sortedPorts)
                 {
-                    Console.WriteLine($"  {p.Port,-10} {p.Connections,-13} {FormatTraffic(p.BytesSent, p.BytesReceived)}");
+                    string errStr = p.Errors > 0 ? $"{p.Errors}" : "0";
+                    Console.Write($"  {p.Port,-10} {p.Connections,-13} ");
+                    if (p.Errors > 0)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.Write($"{errStr,-8} ");
+                        Console.ResetColor();
+                    }
+                    else
+                    {
+                        Console.Write($"{errStr,-8} ");
+                    }
+                    Console.WriteLine($"{FormatTraffic(p.BytesSent, p.BytesReceived)}");
                 }
             }
 
             Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("--------------------------------------------------------------------------------------------------");
             Console.ResetColor();
         }
     }
@@ -565,6 +686,11 @@ public static class ConsoleLogger
                         Console.WriteLine();
                         return null;
                     }
+                    if (key.Key == ConsoleKey.Tab)
+                    {
+                        Console.WriteLine();
+                        return "t";
+                    }
                     if (key.Key == ConsoleKey.Backspace)
                     {
                         if (sb.Length > 0)
@@ -575,6 +701,12 @@ public static class ConsoleLogger
                     }
                     else if (!char.IsControl(key.KeyChar))
                     {
+                        if (sb.Length == 0 && (key.Key == ConsoleKey.T || key.Key == ConsoleKey.S))
+                        {
+                            Console.WriteLine(key.KeyChar);
+                            return "t";
+                        }
+
                         sb.Append(key.KeyChar);
                         Console.Write(key.KeyChar);
                     }
@@ -613,14 +745,34 @@ public static class ConsoleLogger
     }
 }
 
+public enum IpSortMode
+{
+    Connections,    // Топ по подключениям
+    TotalTraffic,   // Суммарный трафик
+    Incoming,       // Топ по входящему трафику (↓)
+    Outgoing        // Топ по исходящему трафику (↑)
+}
+
+public enum PortSortMode
+{
+    PortNumber,     // По номеру порта (по умолчанию)
+    Connections,    // По количеству соединений
+    TotalTraffic,   // Суммарный трафик
+    Incoming,       // Входящий трафик (↓)
+    Outgoing,       // Исходящий трафик (↑)
+    Errors          // По количеству ошибок
+}
+
 public sealed class IpPortStats
 {
     public int Port { get; }
     private long _connections;
+    private long _errors;
     private long _bytesSent;
     private long _bytesReceived;
 
     public long Connections => Volatile.Read(ref _connections);
+    public long Errors => Volatile.Read(ref _errors);
     public long BytesSent => Volatile.Read(ref _bytesSent);
     public long BytesReceived => Volatile.Read(ref _bytesReceived);
     public long TotalBytes => BytesSent + BytesReceived;
@@ -628,6 +780,7 @@ public sealed class IpPortStats
     public IpPortStats(int port) => Port = port;
 
     public void IncrementConnection() => Interlocked.Increment(ref _connections);
+    public void IncrementError() => Interlocked.Increment(ref _errors);
 
     public void AddBytes(long sent, long recv)
     {
@@ -640,10 +793,12 @@ public sealed class IpStatsEntry
 {
     public string Ip { get; }
     private long _totalConnections;
+    private long _totalErrors;
     private long _totalBytesSent;
     private long _totalBytesReceived;
 
     public long TotalConnections => Volatile.Read(ref _totalConnections);
+    public long TotalErrors => Volatile.Read(ref _totalErrors);
     public long TotalBytesSent => Volatile.Read(ref _totalBytesSent);
     public long TotalBytesReceived => Volatile.Read(ref _totalBytesReceived);
     public long TotalBytes => TotalBytesSent + TotalBytesReceived;
@@ -673,6 +828,14 @@ public sealed class IpStatsEntry
         LastSeen = DateTime.Now;
     }
 
+    public void RecordError(int port)
+    {
+        Interlocked.Increment(ref _totalErrors);
+        var portStats = Ports.GetOrAdd(port, static p => new IpPortStats(p));
+        portStats.IncrementError();
+        LastSeen = DateTime.Now;
+    }
+
     public void RecordBytes(int port, long sent, long recv)
     {
         Interlocked.Add(ref _totalBytesSent, sent);
@@ -694,18 +857,49 @@ public sealed class IpStatsEntry
         }
     }
 
-    public string GetTopPortsFormatted(int topCount = 5)
+    public string GetTopPortsFormatted(IpSortMode sortMode, int topCount = 5)
     {
         if (IsFullPortScan)
         {
             return "1-65535 (явный порт скан)";
         }
 
-        var top = Ports.Values
-            .OrderByDescending(p => p.Connections)
-            .ThenBy(p => p.Port)
-            .Take(topCount)
-            .Select(p => $"{p.Port}:{p.Connections}");
+        IEnumerable<string> top;
+        switch (sortMode)
+        {
+            case IpSortMode.TotalTraffic:
+                top = Ports.Values
+                    .OrderByDescending(p => p.TotalBytes)
+                    .ThenBy(p => p.Port)
+                    .Take(topCount)
+                    .Select(p => $"{p.Port}:{ConsoleLogger.FormatBytes(p.TotalBytes)}");
+                break;
+
+            case IpSortMode.Incoming:
+                top = Ports.Values
+                    .OrderByDescending(p => p.BytesReceived)
+                    .ThenBy(p => p.Port)
+                    .Take(topCount)
+                    .Select(p => $"{p.Port}:↓{ConsoleLogger.FormatBytes(p.BytesReceived)}");
+                break;
+
+            case IpSortMode.Outgoing:
+                top = Ports.Values
+                    .OrderByDescending(p => p.BytesSent)
+                    .ThenBy(p => p.Port)
+                    .Take(topCount)
+                    .Select(p => $"{p.Port}:↑{ConsoleLogger.FormatBytes(p.BytesSent)}");
+                break;
+
+            case IpSortMode.Connections:
+            default:
+                top = Ports.Values
+                    .OrderByDescending(p => p.Connections)
+                    .ThenBy(p => p.Port)
+                    .Take(topCount)
+                    .Select(p => $"{p.Port}:{p.Connections}");
+                break;
+        }
 
         return $"ТОП ({string.Join(", ", top)})";
     }
@@ -715,11 +909,38 @@ public static class IpStatsTracker
 {
     private static readonly ConcurrentDictionary<string, IpStatsEntry> _stats = new();
 
+    public static string GetSortName(IpSortMode mode) => mode switch
+    {
+        IpSortMode.Connections => "По подключениям",
+        IpSortMode.TotalTraffic => "По суммарному трафику",
+        IpSortMode.Incoming => "По входящему трафику (↓)",
+        IpSortMode.Outgoing => "По исходящему трафику (↑)",
+        _ => mode.ToString()
+    };
+
+    public static string GetPortSortName(PortSortMode mode) => mode switch
+    {
+        PortSortMode.PortNumber => "По номеру порта (1..65535)",
+        PortSortMode.Connections => "По подключениям",
+        PortSortMode.TotalTraffic => "По суммарному трафику",
+        PortSortMode.Incoming => "По входящему трафику (↓)",
+        PortSortMode.Outgoing => "По исходящему трафику (↑)",
+        PortSortMode.Errors => "По количеству ошибок",
+        _ => mode.ToString()
+    };
+
     public static void RecordConnection(string ip, int port)
     {
         if (string.IsNullOrWhiteSpace(ip) || ip == "Unknown") return;
         var entry = _stats.GetOrAdd(ip, static key => new IpStatsEntry(key));
         entry.RecordConnection(port);
+    }
+
+    public static void RecordError(string ip, int port)
+    {
+        if (string.IsNullOrWhiteSpace(ip) || ip == "Unknown") return;
+        var entry = _stats.GetOrAdd(ip, static key => new IpStatsEntry(key));
+        entry.RecordError(port);
     }
 
     public static void RecordBytes(string ip, int port, long sent, long recv)
@@ -731,12 +952,16 @@ public static class IpStatsTracker
         }
     }
 
-    public static IReadOnlyList<IpStatsEntry> GetAll()
+    public static IReadOnlyList<IpStatsEntry> GetAll(IpSortMode sortMode = IpSortMode.Connections)
     {
-        return _stats.Values
-            .OrderByDescending(e => e.TotalConnections)
-            .ThenBy(e => e.Ip)
-            .ToList();
+        var values = _stats.Values;
+        return sortMode switch
+        {
+            IpSortMode.TotalTraffic => values.OrderByDescending(e => e.TotalBytes).ThenByDescending(e => e.TotalConnections).ThenBy(e => e.Ip).ToList(),
+            IpSortMode.Incoming => values.OrderByDescending(e => e.TotalBytesReceived).ThenByDescending(e => e.TotalConnections).ThenBy(e => e.Ip).ToList(),
+            IpSortMode.Outgoing => values.OrderByDescending(e => e.TotalBytesSent).ThenByDescending(e => e.TotalConnections).ThenBy(e => e.Ip).ToList(),
+            IpSortMode.Connections or _ => values.OrderByDescending(e => e.TotalConnections).ThenByDescending(e => e.TotalBytes).ThenBy(e => e.Ip).ToList(),
+        };
     }
 
     public static void Clear()
@@ -963,6 +1188,7 @@ public sealed class ForwardingService : IAsyncDisposable
             {
                 sw.Stop();
                 _rule.DecrementConnections();
+                IpStatsTracker.RecordError(clientIp, _rule.ListenPort);
 
                 string errMsg = $"[#{connId}] Ошибка/таймаут сессии {clientEp} -> {_rule.TargetHost}:{_rule.TargetPort}: {ex.Message} | Активных: {_rule.ActiveConnections}";
                 ConsoleLogger.Log(ConsoleColor.Red, "ERROR", errMsg);
