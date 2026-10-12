@@ -4,6 +4,11 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.ServiceProcess;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Hosting.WindowsServices;
+using Microsoft.Win32;
 
 namespace PortForwarder;
 
@@ -1247,16 +1252,412 @@ public sealed class ForwardingService : IAsyncDisposable
     }
 }
 
+public static class PortRegistry
+{
+    private const string SubKeyPath = @"Software\PortForwarder";
+    private const string RulesValueName = "Rules";
+    private const string IdleTimeoutValueName = "IdleTimeout";
+
+    public static bool SaveRules(IEnumerable<ForwardRule> rules, int idleTimeoutSeconds, out string errorMessage)
+    {
+        errorMessage = string.Empty;
+        var ruleList = rules.ToList();
+        string[] ruleStrings = ruleList.Select(r =>
+        {
+            if (r.ListenHost == "0.0.0.0" || r.ListenHost == "*")
+                return $"{r.ListenPort}:{r.TargetHost}:{r.TargetPort}";
+            return $"{r.ListenHost}:{r.ListenPort}:{r.TargetHost}:{r.TargetPort}";
+        }).ToArray();
+
+        // 1. Попытка записать в HKLM
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+            using var key = baseKey.CreateSubKey(SubKeyPath, true);
+            if (key != null)
+            {
+                key.SetValue(RulesValueName, ruleStrings, RegistryValueKind.MultiString);
+                key.SetValue(IdleTimeoutValueName, idleTimeoutSeconds, RegistryValueKind.DWord);
+                return true;
+            }
+        }
+        catch (Exception exHklm)
+        {
+            // Если нет прав на HKLM, пробуем HKCU
+            try
+            {
+                using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64);
+                using var key = baseKey.CreateSubKey(SubKeyPath, true);
+                if (key != null)
+                {
+                    key.SetValue(RulesValueName, ruleStrings, RegistryValueKind.MultiString);
+                    key.SetValue(IdleTimeoutValueName, idleTimeoutSeconds, RegistryValueKind.DWord);
+                    return true;
+                }
+            }
+            catch (Exception exHkcu)
+            {
+                errorMessage = $"Не удалось сохранить правила в реестр (HKLM: {exHklm.Message}; HKCU: {exHkcu.Message})";
+                return false;
+            }
+        }
+
+        errorMessage = "Не удалось открыть ветку реестра для записи.";
+        return false;
+    }
+
+    public static bool LoadRules(out List<ForwardRule> rules, out int idleTimeoutSeconds, out string location)
+    {
+        rules = new List<ForwardRule>();
+        idleTimeoutSeconds = 120;
+        location = string.Empty;
+
+        // 1. Проверяем HKLM
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+            using var key = baseKey.OpenSubKey(SubKeyPath, false);
+            if (key != null)
+            {
+                if (TryReadFromKey(key, out rules, out idleTimeoutSeconds))
+                {
+                    location = @"HKLM\Software\PortForwarder";
+                    return true;
+                }
+            }
+        }
+        catch { }
+
+        // 2. Проверяем HKCU
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64);
+            using var key = baseKey.OpenSubKey(SubKeyPath, false);
+            if (key != null)
+            {
+                if (TryReadFromKey(key, out rules, out idleTimeoutSeconds))
+                {
+                    location = @"HKCU\Software\PortForwarder";
+                    return true;
+                }
+            }
+        }
+        catch { }
+
+        return false;
+    }
+
+    private static bool TryReadFromKey(RegistryKey key, out List<ForwardRule> rules, out int idleTimeoutSeconds)
+    {
+        rules = new List<ForwardRule>();
+        idleTimeoutSeconds = 120;
+
+        object? timeoutObj = key.GetValue(IdleTimeoutValueName);
+        if (timeoutObj is int tVal)
+        {
+            idleTimeoutSeconds = tVal;
+        }
+
+        object? rulesObj = key.GetValue(RulesValueName);
+        if (rulesObj is string[] ruleArr)
+        {
+            foreach (var rStr in ruleArr)
+            {
+                if (ForwardRule.TryParse(rStr, out var rule, out _))
+                {
+                    if (rule != null && !rules.Any(r => r.ConflictsWith(rule)))
+                        rules.Add(rule);
+                }
+            }
+            return rules.Count > 0;
+        }
+        else if (rulesObj is string singleStr && !string.IsNullOrWhiteSpace(singleStr))
+        {
+            if (ForwardRule.TryParse(singleStr, out var rule, out _))
+            {
+                if (rule != null)
+                    rules.Add(rule);
+            }
+            return rules.Count > 0;
+        }
+
+        return false;
+    }
+
+    public static bool ClearRules(out string message)
+    {
+        bool clearedAny = false;
+        var details = new List<string>();
+
+        // Удаляем из HKLM
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+            using var key = baseKey.OpenSubKey(SubKeyPath, true);
+            if (key != null)
+            {
+                key.DeleteValue(RulesValueName, false);
+                key.DeleteValue(IdleTimeoutValueName, false);
+                clearedAny = true;
+                details.Add(@"HKLM\Software\PortForwarder");
+            }
+        }
+        catch { }
+
+        // Удаляем из HKCU
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64);
+            using var key = baseKey.OpenSubKey(SubKeyPath, true);
+            if (key != null)
+            {
+                key.DeleteValue(RulesValueName, false);
+                key.DeleteValue(IdleTimeoutValueName, false);
+                clearedAny = true;
+                details.Add(@"HKCU\Software\PortForwarder");
+            }
+        }
+        catch { }
+
+        if (clearedAny)
+        {
+            message = $"Параметры проброса портов удалены из реестра ({string.Join(", ", details)}).";
+            return true;
+        }
+
+        message = "Параметры проброса портов в реестре не найдены.";
+        return false;
+    }
+}
+
+public static class ServiceManager
+{
+    public const string ServiceName = "PortForwarder";
+    public const string DisplayName = "TCP Port Forwarder Service";
+    public const string Description = "Служба проброса портов TCP (Port Forwarder) на базе правил из реестра Windows.";
+
+    public static bool IsInstalled()
+    {
+        try
+        {
+            using var sc = new ServiceController(ServiceName);
+            _ = sc.Status;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static int InstallService(string[] forwarderArgs)
+    {
+        string? exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath))
+        {
+            ConsoleLogger.Log(ConsoleColor.Red, "SERVICE", "Не удалось определить путь к исполняемому файлу.");
+            return 1;
+        }
+
+        // Аргументы для работы службы: служба запускается с флагом -service -last (или указанными правилами)
+        string serviceBinArgs = "-service run";
+        if (forwarderArgs.Length > 0)
+        {
+            var cleanArgs = forwarderArgs.Where(a => !a.Equals("-service", StringComparison.OrdinalIgnoreCase) &&
+                                                     !a.Equals("install", StringComparison.OrdinalIgnoreCase) &&
+                                                     !a.Equals("-install", StringComparison.OrdinalIgnoreCase) &&
+                                                     !a.Equals("--install", StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (cleanArgs.Length > 0)
+            {
+                serviceBinArgs = "-service run " + string.Join(" ", cleanArgs.Select(a => $"\"{a}\""));
+            }
+        }
+        else
+        {
+            serviceBinArgs = "-service run -last";
+        }
+
+        string fullBinPath = $"\"{exePath}\" {serviceBinArgs}";
+
+        if (IsInstalled())
+        {
+            ConsoleLogger.Log(ConsoleColor.Yellow, "SERVICE", $"Служба '{ServiceName}' уже установлена. Обновление конфигурации...");
+            int stopResult = RunSc($"stop \"{ServiceName}\"");
+            int configResult = RunSc($"config \"{ServiceName}\" binPath= \"{fullBinPath}\" start= auto DisplayName= \"{DisplayName}\"");
+            RunSc($"description \"{ServiceName}\" \"{Description}\"");
+            if (configResult == 0)
+            {
+                ConsoleLogger.Log(ConsoleColor.Green, "SERVICE", $"Конфигурация службы '{ServiceName}' успешно обновлена (binPath: {fullBinPath}).");
+                return 0;
+            }
+            return configResult;
+        }
+
+        ConsoleLogger.Log(ConsoleColor.Cyan, "SERVICE", $"Регистрация службы '{ServiceName}' в системе...");
+        int createResult = RunSc($"create \"{ServiceName}\" binPath= \"{fullBinPath}\" start= auto DisplayName= \"{DisplayName}\"");
+        if (createResult != 0)
+        {
+            ConsoleLogger.Log(ConsoleColor.Red, "SERVICE", $"Ошибка при создании службы через sc.exe (Код ошибки: {createResult}). Запустите консоль от имени Администратора.");
+            return createResult;
+        }
+
+        RunSc($"description \"{ServiceName}\" \"{Description}\"");
+        ConsoleLogger.Log(ConsoleColor.Green, "SERVICE", $"Служба '{ServiceName}' успешно установлена с автозапуском (binPath: {fullBinPath}).");
+        return 0;
+    }
+
+    public static int UninstallService()
+    {
+        if (!IsInstalled())
+        {
+            ConsoleLogger.Log(ConsoleColor.Yellow, "SERVICE", $"Служба '{ServiceName}' не установлена в системе.");
+            return 0;
+        }
+
+        ConsoleLogger.Log(ConsoleColor.Cyan, "SERVICE", $"Остановка и удаление службы '{ServiceName}'...");
+        RunSc($"stop \"{ServiceName}\"");
+        int delResult = RunSc($"delete \"{ServiceName}\"");
+        if (delResult == 0)
+        {
+            ConsoleLogger.Log(ConsoleColor.Green, "SERVICE", $"Служба '{ServiceName}' успешно удалена из системы.");
+            return 0;
+        }
+
+        ConsoleLogger.Log(ConsoleColor.Red, "SERVICE", $"Не удалось удалить службу '{ServiceName}' (Код: {delResult}). Запустите консоль от имени Администратора.");
+        return delResult;
+    }
+
+    public static int StartService()
+    {
+        if (!IsInstalled())
+        {
+            ConsoleLogger.Log(ConsoleColor.Red, "SERVICE", $"Служба '{ServiceName}' не установлена.");
+            return 1;
+        }
+
+        int res = RunSc($"start \"{ServiceName}\"");
+        if (res == 0)
+            ConsoleLogger.Log(ConsoleColor.Green, "SERVICE", $"Служба '{ServiceName}' запущена.");
+        return res;
+    }
+
+    public static int StopService()
+    {
+        if (!IsInstalled())
+        {
+            ConsoleLogger.Log(ConsoleColor.Yellow, "SERVICE", $"Служба '{ServiceName}' не установлена.");
+            return 0;
+        }
+
+        int res = RunSc($"stop \"{ServiceName}\"");
+        if (res == 0)
+            ConsoleLogger.Log(ConsoleColor.Green, "SERVICE", $"Служба '{ServiceName}' остановлена.");
+        return res;
+    }
+
+    private static int RunSc(string arguments)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("sc.exe", arguments)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return -1;
+            proc.WaitForExit();
+            return proc.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            ConsoleLogger.Log(ConsoleColor.Red, "SERVICE", $"Исключение при вызове sc.exe: {ex.Message}");
+            return -1;
+        }
+    }
+}
+
+public sealed class ForwarderBackgroundService : BackgroundService
+{
+    private readonly IReadOnlyList<ForwardRule> _rules;
+    private readonly int _idleTimeoutSeconds;
+
+    public ForwarderBackgroundService(IReadOnlyList<ForwardRule> rules, int idleTimeoutSeconds)
+    {
+        _rules = rules;
+        _idleTimeoutSeconds = idleTimeoutSeconds;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        EventViewerLogger.LogInformation($"Фоновая служба Windows Service запущена. Правил: {_rules.Count}", 1001);
+
+        var services = new List<ForwardingService>();
+        try
+        {
+            foreach (var rule in _rules)
+            {
+                var service = new ForwardingService(rule, _idleTimeoutSeconds);
+                service.Start();
+                services.Add(service);
+            }
+
+            await Task.Delay(Timeout.Infinite, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // Корректная остановка
+        }
+        finally
+        {
+            string statusReport = ConsoleLogger.BuildStatusReport(_rules);
+            EventViewerLogger.LogInformation(statusReport, 1005);
+
+            foreach (var svc in services)
+            {
+                await svc.DisposeAsync();
+            }
+
+            EventViewerLogger.LogInformation("Фоновая служба Windows Service корректно остановлена.", 1004);
+        }
+    }
+}
+
 public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
 
-        var rules = new List<ForwardRule>();
-        int idleTimeoutSeconds = 120;
+        // 1. Проверка на режим фоновой службы Windows Service
+        if (WindowsServiceHelpers.IsWindowsService())
+        {
+            return await RunAsWindowsServiceAsync(args);
+        }
 
+        // 2. Если аргументы не переданы вообще — выводим справку и текущие значения из реестра
+        if (args.Length == 0)
+        {
+            PrintHelp();
+            Console.WriteLine();
+            PrintRegistryValues();
+            return 0;
+        }
+
+        // 3. Разбор аргументов командной строки
+        bool isServiceCommand = false;
+        string? serviceSubCommand = null;
+
+        bool useLastConfig = false;
+        bool saveToRegistry = false;
+        bool clearRegistry = false;
+        bool showRegistryOnly = false;
+
+        int idleTimeoutSeconds = 120;
         var rawRules = new List<string>();
+
         for (int i = 0; i < args.Length; i++)
         {
             var arg = args[i];
@@ -1266,7 +1667,49 @@ public static class Program
                 arg.Equals("/?", StringComparison.OrdinalIgnoreCase))
             {
                 PrintHelp();
+                Console.WriteLine();
+                PrintRegistryValues();
                 return 0;
+            }
+
+            if (arg.Equals("show", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("-show", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("--show", StringComparison.OrdinalIgnoreCase))
+            {
+                showRegistryOnly = true;
+                continue;
+            }
+
+            if (arg.Equals("-service", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("--service", StringComparison.OrdinalIgnoreCase))
+            {
+                isServiceCommand = true;
+                if (i + 1 < args.Length && !args[i + 1].StartsWith('-'))
+                {
+                    serviceSubCommand = args[++i].ToLowerInvariant();
+                }
+                continue;
+            }
+
+            if (arg.Equals("-last", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("--last", StringComparison.OrdinalIgnoreCase))
+            {
+                useLastConfig = true;
+                continue;
+            }
+
+            if (arg.Equals("-save", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("--save", StringComparison.OrdinalIgnoreCase))
+            {
+                saveToRegistry = true;
+                continue;
+            }
+
+            if (arg.Equals("-clear", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("--clear", StringComparison.OrdinalIgnoreCase))
+            {
+                clearRegistry = true;
+                continue;
             }
 
             if (arg.StartsWith("--idle-timeout=", StringComparison.OrdinalIgnoreCase))
@@ -1286,15 +1729,93 @@ public static class Program
             rawRules.Add(arg);
         }
 
-        if (rawRules.Count == 0)
+        // Обработка просмотра сохраненных в реестре значений (show / -show)
+        if (showRegistryOnly)
         {
-            string defaultArg = "0.0.0.0:2022:192.168.1.150:22";
-            if (ForwardRule.TryParse(defaultArg, out var defaultRule, out _))
+            PrintRegistryValues();
+            return 0;
+        }
+
+        // Обработка очистки реестра (-clear)
+        if (clearRegistry)
+        {
+            PortRegistry.ClearRules(out string msg);
+            ConsoleLogger.Log(ConsoleColor.Yellow, "REGISTRY", msg);
+            return 0;
+        }
+
+        // 4. Обработка команд управления службой (-service install / uninstall / start / stop / status / run)
+        if (isServiceCommand)
+        {
+            return await HandleServiceCommandAsync(serviceSubCommand, rawRules, useLastConfig, idleTimeoutSeconds);
+        }
+
+        // Обработка сохранения правил в реестр (-save) без запуска проброса
+        if (saveToRegistry)
+        {
+            var rulesToSave = new List<ForwardRule>();
+
+            if (rawRules.Count == 0)
             {
-                rules.Add(defaultRule!);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Ошибка: Для ключа -save необходимо указать хотя бы одно правило проброса (например: -save 2022:192.168.1.150:22).");
+                Console.ResetColor();
+                return 1;
+            }
+
+            foreach (var ruleStr in rawRules)
+            {
+                if (!ForwardRule.TryParse(ruleStr, out var rule, out string error))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"Ошибка в параметре '{ruleStr}': {error}");
+                    Console.ResetColor();
+                    return 1;
+                }
+
+                if (rulesToSave.Any(r => r.ConflictsWith(rule!)))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"Ошибка: Конфликт правил прослушивания! Правило '{rule}' конфликтует с уже добавленным правилом.");
+                    Console.ResetColor();
+                    return 1;
+                }
+
+                rulesToSave.Add(rule!);
+            }
+
+            if (PortRegistry.SaveRules(rulesToSave, idleTimeoutSeconds, out string saveErr))
+            {
+                ConsoleLogger.Log(ConsoleColor.Green, "REGISTRY", $"Конфигурация пробросов ({rulesToSave.Count} правил) успешно сохранена в реестр.");
+                return 0;
+            }
+            else
+            {
+                ConsoleLogger.Log(ConsoleColor.Red, "REGISTRY", $"Ошибка сохранения в реестр: {saveErr}");
+                return 1;
             }
         }
-        else
+
+        // 4. Обычный запуск приложения (консольный режим)
+        var rules = new List<ForwardRule>();
+
+        if (useLastConfig)
+        {
+            if (PortRegistry.LoadRules(out var loadedRules, out int loadedTimeout, out string location))
+            {
+                rules.AddRange(loadedRules);
+                if (idleTimeoutSeconds == 120 && loadedTimeout != 120)
+                    idleTimeoutSeconds = loadedTimeout;
+                ConsoleLogger.Log(ConsoleColor.Cyan, "REGISTRY", $"Загружено {rules.Count} правил проброса из реестра ({location}).");
+            }
+            else
+            {
+                ConsoleLogger.Log(ConsoleColor.Yellow, "REGISTRY", "Сохраненные правила проброса в реестре не найдены. Будут применены параметры из командной строки / по умолчанию.");
+            }
+        }
+
+        // Добавляем правила из командной строки
+        if (rawRules.Count > 0)
         {
             foreach (var ruleStr in rawRules)
             {
@@ -1320,6 +1841,229 @@ public static class Program
             }
         }
 
+        // Если правил всё ещё нет — используем правило по умолчанию
+        if (rules.Count == 0)
+        {
+            string defaultArg = "0.0.0.0:2022:192.168.1.150:22";
+            if (ForwardRule.TryParse(defaultArg, out var defaultRule, out _))
+            {
+                rules.Add(defaultRule!);
+            }
+        }
+
+        // При запуске с явными новыми правилами сохраняем их в реестр как последнее активное состояние
+        if (rawRules.Count > 0 && !useLastConfig)
+        {
+            if (PortRegistry.SaveRules(rules, idleTimeoutSeconds, out string saveErr))
+            {
+                ConsoleLogger.Log(ConsoleColor.Green, "REGISTRY", $"Конфигурация пробросов ({rules.Count} правил) сохранена в реестр для последующего запуска с -last.");
+            }
+            else
+            {
+                ConsoleLogger.Log(ConsoleColor.Yellow, "REGISTRY", $"Предупреждение при сохранении в реестр: {saveErr}");
+            }
+        }
+
+        // Запуск прослушивания в консольном интерактивном режиме
+        return await RunConsoleInteractiveAsync(rules, idleTimeoutSeconds);
+    }
+
+    private static async Task<int> HandleServiceCommandAsync(string? subCommand, List<string> rawRules, bool useLastConfig, int idleTimeoutSeconds)
+    {
+        switch (subCommand)
+        {
+            case "install":
+            case "-install":
+            case "--install":
+            case "i":
+            {
+                // При установке службы, если указаны правила, сохраняем их в реестр
+                var rulesToInstall = new List<ForwardRule>();
+                foreach (var rStr in rawRules)
+                {
+                    if (ForwardRule.TryParse(rStr, out var r, out string err))
+                    {
+                        if (r != null && !rulesToInstall.Any(x => x.ConflictsWith(r)))
+                            rulesToInstall.Add(r);
+                    }
+                    else
+                    {
+                        ConsoleLogger.Log(ConsoleColor.Red, "SERVICE", $"Некорректное правило '{rStr}': {err}");
+                        return 1;
+                    }
+                }
+
+                if (rulesToInstall.Count > 0)
+                {
+                    if (PortRegistry.SaveRules(rulesToInstall, idleTimeoutSeconds, out string saveErr))
+                    {
+                        ConsoleLogger.Log(ConsoleColor.Green, "REGISTRY", $"Правила для службы сохранены в реестр ({rulesToInstall.Count} правил).");
+                    }
+                    else
+                    {
+                        ConsoleLogger.Log(ConsoleColor.Yellow, "REGISTRY", $"Предупреждение: {saveErr}");
+                    }
+                }
+
+                int code = ServiceManager.InstallService(rawRules.ToArray());
+                if (code == 0)
+                {
+                    Console.WriteLine();
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"Для запуска службы используйте: PortForwarder -service start   (или: sc start {ServiceManager.ServiceName})");
+                    Console.WriteLine($"Для удаления службы используйте: PortForwarder -service uninstall (или: sc delete {ServiceManager.ServiceName})");
+                    Console.ResetColor();
+                }
+                return code;
+            }
+
+            case "uninstall":
+            case "-uninstall":
+            case "--uninstall":
+            case "remove":
+            case "u":
+            {
+                return ServiceManager.UninstallService();
+            }
+
+            case "start":
+            {
+                return ServiceManager.StartService();
+            }
+
+            case "stop":
+            {
+                return ServiceManager.StopService();
+            }
+
+            case "status":
+            {
+                bool installed = ServiceManager.IsInstalled();
+                Console.WriteLine($"Статус службы '{ServiceManager.ServiceName}': {(installed ? "Установлена" : "Не установлена")}");
+                if (PortRegistry.LoadRules(out var regRules, out int to, out string loc))
+                {
+                    Console.WriteLine($"Правила в реестре ({loc}, Idle-Timeout: {to}с):");
+                    foreach (var r in regRules)
+                    {
+                        Console.WriteLine($"  * {r}");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Правила в реестре: не найдены.");
+                }
+                return 0;
+            }
+
+            case "run":
+            {
+                // Запуск службы Service Control Manager
+                var rules = new List<ForwardRule>();
+                if (useLastConfig || rawRules.Count == 0)
+                {
+                    if (PortRegistry.LoadRules(out var loadedRules, out int to, out _))
+                    {
+                        rules.AddRange(loadedRules);
+                        idleTimeoutSeconds = to;
+                    }
+                }
+
+                foreach (var rStr in rawRules)
+                {
+                    if (ForwardRule.TryParse(rStr, out var r, out _) && r != null && !rules.Any(x => x.ConflictsWith(r)))
+                        rules.Add(r);
+                }
+
+                if (rules.Count == 0)
+                {
+                    rules.Add(new ForwardRule("0.0.0.0", 2022, "192.168.1.150", 22));
+                }
+
+                return await RunHostServiceAsync(rules, idleTimeoutSeconds);
+            }
+
+            default:
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"Неизвестная подкоманда для -service: '{subCommand}'. Допустимы: install, uninstall, start, stop, status, run.");
+                Console.ResetColor();
+                return 1;
+            }
+        }
+    }
+
+    private static async Task<int> RunAsWindowsServiceAsync(string[] args)
+    {
+        var rules = new List<ForwardRule>();
+        int idleTimeoutSeconds = 120;
+
+        // Если служба стартовала от SCM, читаем правила из реестра
+        if (PortRegistry.LoadRules(out var regRules, out int regTimeout, out _))
+        {
+            rules.AddRange(regRules);
+            idleTimeoutSeconds = regTimeout;
+        }
+
+        // Также учитываем аргументы, если они были переданы в binPath
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (a.Equals("-service", StringComparison.OrdinalIgnoreCase) || a.Equals("run", StringComparison.OrdinalIgnoreCase) || a.Equals("-last", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (a.StartsWith("--idle-timeout=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(a["--idle-timeout=".Length..], out int t)) idleTimeoutSeconds = t;
+                continue;
+            }
+
+            if (a.Equals("--idle-timeout", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                if (int.TryParse(args[++i], out int t)) idleTimeoutSeconds = t;
+                continue;
+            }
+
+            if (ForwardRule.TryParse(a, out var r, out _) && r != null && !rules.Any(x => x.ConflictsWith(r)))
+            {
+                rules.Add(r);
+            }
+        }
+
+        if (rules.Count == 0)
+        {
+            rules.Add(new ForwardRule("0.0.0.0", 2022, "192.168.1.150", 22));
+        }
+
+        return await RunHostServiceAsync(rules, idleTimeoutSeconds);
+    }
+
+    private static async Task<int> RunHostServiceAsync(IReadOnlyList<ForwardRule> rules, int idleTimeoutSeconds)
+    {
+        try
+        {
+            var builder = Host.CreateDefaultBuilder();
+            builder.UseWindowsService(options =>
+            {
+                options.ServiceName = ServiceManager.ServiceName;
+            });
+            builder.ConfigureServices(services =>
+            {
+                services.AddHostedService(_ => new ForwarderBackgroundService(rules, idleTimeoutSeconds));
+            });
+
+            var host = builder.Build();
+            await host.RunAsync();
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            EventViewerLogger.LogError($"Критический сбой службы Windows: {ex.Message}", 3001);
+            return 1;
+        }
+    }
+
+    private static async Task<int> RunConsoleInteractiveAsync(IReadOnlyList<ForwardRule> rules, int idleTimeoutSeconds)
+    {
         ConsoleLogger.PrintHeader(rules, idleTimeoutSeconds);
 
         var services = new List<ForwardingService>();
@@ -1438,7 +2182,6 @@ public static class Program
         }
 
         AppDomain.CurrentDomain.ProcessExit += (s, e) => LogFinalStats();
-
         LogFinalStats();
 
         foreach (var svc in services)
@@ -1456,24 +2199,74 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine("Использование:");
         Console.WriteLine("  PortForwarder [опции] [[listen_ip:]listen_port:target_ip:target_port] ...");
+        Console.WriteLine("  PortForwarder -service [install|uninstall|start|stop|status] [правила...]");
+        Console.WriteLine("  PortForwarder -last");
         Console.WriteLine();
         Console.WriteLine("Формат правил:");
         Console.WriteLine("  *([listen_ip][:])!([listen_port][:])!([target_ip][:])!([target_port])");
         Console.WriteLine("  где listen_ip опционален (по умолчанию 0.0.0.0 - все интерфейсы).");
         Console.WriteLine();
-        Console.WriteLine("Опции:");
-        Console.WriteLine("  --idle-timeout <сек>   Таймаут простоя неактивного соединения (по умолчанию 120с). 0 = выключить.");
+        Console.WriteLine("Опции и команды:");
+        Console.WriteLine("  -service install [правила]   Установить приложение как службу Windows (с автозапуском).");
+        Console.WriteLine("  -service uninstall           Остановить и удалить службу Windows.");
+        Console.WriteLine("  -service start / stop        Запустить или остановить установленную службу.");
+        Console.WriteLine("  -service status              Проверить статус службы и правила в реестре.");
+        Console.WriteLine("  -last                        Запустить приложение (или службу) с правилами из реестра.");
+        Console.WriteLine("  show / -show                 Отобразить текущие значения и правила из реестра Windows.");
+        Console.WriteLine("  -save                        Сохранить указанные правила в реестр Windows и выйти (без запуска проброса).");
+        Console.WriteLine("  -clear                       Очистить сохраненные правила проброса из реестра и выйти (без запуска проброса).");
+        Console.WriteLine("  --idle-timeout <сек>         Таймаут простоя неактивного соединения (по умолчанию 120с). 0 = выключить.");
+        Console.WriteLine();
+        Console.WriteLine("Раздел реестра:");
+        Console.WriteLine(@"  HKLM\Software\PortForwarder или HKCU\Software\PortForwarder");
+        Console.WriteLine("  Параметры: Rules (REG_MULTI_SZ), IdleTimeout (REG_DWORD)");
         Console.WriteLine();
         Console.WriteLine("Примеры:");
+        Console.WriteLine("  PortForwarder                       # Показать справку и текущие значения в реестре");
+        Console.WriteLine("  PortForwarder show                  # Показать сохраненные значения в реестре");
         Console.WriteLine("  PortForwarder 2022:192.168.1.150:22");
-        Console.WriteLine("  PortForwarder 0.0.0.0:2022:192.168.1.150:22");
-        Console.WriteLine("  PortForwarder 127.0.0.1:2022:192.168.1.150:22");
-        Console.WriteLine("  PortForwarder 192.168.1.24:8088:192.168.1.150:8080");
-        Console.WriteLine("  PortForwarder --idle-timeout 60 2022:192.168.1.150:22 8088:192.168.1.150:8080");
+        Console.WriteLine("  PortForwarder -last");
+        Console.WriteLine("  PortForwarder -service install 2022:192.168.1.150:22 8080:192.168.1.150:80");
+        Console.WriteLine("  PortForwarder -service uninstall");
+        Console.WriteLine("  PortForwarder -clear");
         Console.WriteLine();
-        Console.WriteLine("Управление:");
+        Console.WriteLine("Управление в консоли:");
         Console.WriteLine("  Ctrl+C или Q   - Корректная остановка служб и запись финальной статистики в EventViewer");
         Console.WriteLine("  S              - Вывод текущей статистики всех соединений на экран");
         Console.WriteLine("  I              - Статистика подключений по IP-адресам (с детализацией портов и детектом порт-скана)");
+    }
+
+    public static void PrintRegistryValues()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("--------------------------------------------------------------------------------");
+        Console.WriteLine("                   ТЕКУЩИЕ ЗНАЧЕНИЯ В РЕЕСТРЕ WINDOWS                           ");
+        Console.WriteLine("--------------------------------------------------------------------------------");
+        Console.ResetColor();
+
+        if (PortRegistry.LoadRules(out var regRules, out int regTimeout, out string location))
+        {
+            Console.WriteLine($"Раздел реестра    : {location}");
+            Console.WriteLine($"Keep-Alive Timeout: {regTimeout} сек.");
+            Console.WriteLine($"Количество правил : {regRules.Count}");
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("Сохраненные правила проброса:");
+            for (int i = 0; i < regRules.Count; i++)
+            {
+                var r = regRules[i];
+                string ifaceDesc = (r.ListenHost == "0.0.0.0" || r.ListenHost == "*") ? "все интерфейсы (0.0.0.0)" : r.ListenHost;
+                Console.WriteLine($"  [{i + 1}] [{ifaceDesc}]:{r.ListenPort}  ==>  {r.TargetHost}:{r.TargetPort}");
+            }
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.DarkYellow;
+            Console.WriteLine("  В реестре Windows (HKLM/HKCU\\Software\\PortForwarder) правила не найдены.");
+            Console.ResetColor();
+        }
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("--------------------------------------------------------------------------------");
+        Console.ResetColor();
     }
 }
